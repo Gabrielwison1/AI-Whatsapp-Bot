@@ -101,7 +101,7 @@ export async function extractOrderFromText(messageText) {
 async function extractOrderFromTextGemini(messageText) {
   const genAI = getGeminiClient();
   const response = await genAI.models.generateContent({
-    model: "gemini-3.6-flash",
+    model: "gemini-2.0-flash",
     contents: `${TEXT_ORDER_PROMPT}\n\nCustomer message: "${messageText}"`,
     config: {
       responseMimeType: "application/json",
@@ -148,7 +148,7 @@ export async function verifyPrescriptionImage(base64Buffer, mimeType = "image/jp
 async function verifyPrescriptionImageGemini(base64Buffer, mimeType) {
   const genAI = getGeminiClient();
   const response = await genAI.models.generateContent({
-    model: "gemini-3.6-flash",
+    model: "gemini-2.0-flash",
     contents: [
       {
         inlineData: {
