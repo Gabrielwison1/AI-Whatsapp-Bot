@@ -3,8 +3,12 @@ import dotenv from "dotenv";
 import cors from "cors";
 import webhookRouter from "./routes/webhook.js";
 import { healthRouter } from "./routes/health.js";
+import { connectDB } from "./config/db.js";
 
 dotenv.config();
+
+// Connect to MongoDB
+connectDB();
 
 const app = express();
 

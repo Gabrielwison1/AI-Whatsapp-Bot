@@ -1,3 +1,5 @@
+import { Session } from "../models/Session.js";
+
 const SESSION_STATES = {
   IDLE: "IDLE",
   AWAITING_PRESCRIPTION: "AWAITING_PRESCRIPTION",
@@ -5,52 +7,83 @@ const SESSION_STATES = {
   AWAITING_PAYMENT: "AWAITING_PAYMENT",
 };
 
-const sessions = new Map();
-
-let orderCounter = 1041;
-
 export function generateOrderId() {
-  orderCounter += 1;
-  return `ORD-${orderCounter}`;
+  const timestamp = Date.now().toString().slice(-6);
+  const random = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+  return `ORD-${timestamp}${random}`;
 }
 
-export function getSession(phone) {
-  if (!sessions.has(phone)) {
-    sessions.set(phone, {
+export async function getSession(phone) {
+  let session = await Session.findOne({ phone });
+  
+  if (!session) {
+    session = await Session.create({
       phone,
-      state: SESSION_STATES.IDLE,
-      orderData: null,
-      orderId: null,
-      matchedPharmacy: null,
-      prescriptionVerified: false,
-      updatedAt: Date.now(),
+      currentState: SESSION_STATES.IDLE,
     });
   }
-  return sessions.get(phone);
+  
+  // Map back to the expected plain object for compatibility
+  return {
+    phone: session.phone,
+    state: session.currentState,
+    activeOrderId: session.activeOrderId,
+    orderId: session.activeOrderId, // compatibility alias
+    orderData: session.orderData,
+    prescriptionVerified: session.prescriptionVerified,
+    matchedPharmacy: session.matchedPharmacy,
+    updatedAt: session.updatedAt,
+  };
 }
 
-export function updateSession(phone, updates) {
-  const session = getSession(phone);
-  Object.assign(session, updates, { updatedAt: Date.now() });
-  console.log(`[SESSION] ${phone} → state: ${session.state}, orderId: ${session.orderId || "none"}`);
-  return session;
+export async function updateSession(phone, updates) {
+  const mappedUpdates = { ...updates };
+  
+  if (updates.state) {
+    mappedUpdates.currentState = updates.state;
+    delete mappedUpdates.state;
+  }
+  if (updates.orderId) {
+    mappedUpdates.activeOrderId = updates.orderId;
+    delete mappedUpdates.orderId;
+  }
+  
+  mappedUpdates.updatedAt = Date.now();
+  
+  const session = await Session.findOneAndUpdate(
+    { phone },
+    { $set: mappedUpdates },
+    { new: true, upsert: true }
+  );
+  console.log(`[SESSION] ${phone} → state: ${session.currentState}, orderId: ${session.activeOrderId || "none"}`);
+  
+  return {
+    phone: session.phone,
+    state: session.currentState,
+    orderId: session.activeOrderId,
+    orderData: session.orderData,
+    prescriptionVerified: session.prescriptionVerified,
+    matchedPharmacy: session.matchedPharmacy,
+    updatedAt: session.updatedAt,
+  };
 }
 
-export function resetSession(phone) {
-  sessions.set(phone, {
-    phone,
-    state: SESSION_STATES.IDLE,
-    orderData: null,
-    orderId: null,
-    matchedPharmacy: null,
-    prescriptionVerified: false,
-    updatedAt: Date.now(),
-  });
+export async function resetSession(phone) {
+  const session = await Session.findOneAndUpdate(
+    { phone },
+    { 
+      $set: {
+        currentState: SESSION_STATES.IDLE,
+        activeOrderId: null,
+        orderData: null,
+        matchedPharmacy: null,
+        prescriptionVerified: false,
+        updatedAt: Date.now() 
+      }
+    },
+    { new: true }
+  );
   console.log(`[SESSION] ${phone} → reset to IDLE`);
-}
-
-export function getAllSessions() {
-  return Array.from(sessions.values());
 }
 
 export { SESSION_STATES };
