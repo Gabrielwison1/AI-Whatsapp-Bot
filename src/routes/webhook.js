@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { sendWhatsAppMessage, downloadMetaMedia } from "../services/whatsapp.js";
 import { initializePaystackTransaction } from "../services/paystack.js";
 import { extractOrderFromText, verifyPrescriptionImage } from "../services/ai.js";
+import { parsePrescriptionImage } from "../services/geminiVision.js";
 import { findPharmacyByState } from "../db/pharmacies.js";
 import { Order } from "../models/Order.js";
 import {
@@ -125,56 +126,99 @@ async function processNewOrder(from, text) {
 }
 
 async function handleImageMessage(from, image, session) {
-  if (session.state !== SESSION_STATES.AWAITING_PRESCRIPTION) {
-    await sendWhatsAppMessage(
-      from,
-      "I wasn't expecting a photo. Please send your order as a text message first."
-    );
-    return;
-  }
-
   const mediaId = image.id;
-  console.log(`[STATE 2] Received prescription image from ${from}, media ID: ${mediaId}`);
+  console.log(`[STATE 2] Received image from ${from}, media ID: ${mediaId}, session state: ${session.state}`);
 
+  // Immediately acknowledge receipt so the user knows we're working on it
+  await sendWhatsAppMessage(from, "📷 Prescription received! Analyzing the image...");
+
+  // --- Step 1: Download the image binary from Meta's Graph API ---
   const media = await downloadMetaMedia(mediaId);
   if (!media) {
-    await sendWhatsAppMessage(from, "I couldn't download your image. Please try uploading it again.");
-    return;
-  }
-
-  const result = await verifyPrescriptionImage(media.base64Buffer, media.mimeType);
-  if (!result) {
-    await sendWhatsAppMessage(from, "I couldn't analyze your prescription. Please try uploading a clearer photo.");
-    return;
-  }
-
-  console.log(`[AI] Prescription verification for ${from}:`, JSON.stringify(result));
-
-  if (!result.isValid) {
-    console.log(`[STATE 2] Invalid prescription from ${from}, asking re-upload`);
     await sendWhatsAppMessage(
       from,
-      "The image doesn't appear to be a valid medical prescription. Please upload a clear photo of your prescription showing the doctor's details, medications, and signature."
+      "I couldn't download your prescription image. Please try sending it again, or type your medication names manually."
     );
     return;
   }
 
-  console.log(`[STATE 2] Prescription valid for ${from}, medications: ${result.medications.join(", ")}`);
-  await updateSession(from, { prescriptionVerified: true });
+  // Convert base64 string from downloadMetaMedia back to a Buffer for geminiVision
+  const imageBuffer = Buffer.from(media.base64Buffer, "base64");
 
-  const orderData = session.orderData || {};
-  if (result.medications && result.medications.length > 0) {
-    const existingNames = new Set((orderData.items || []).map((i) => i.name.toLowerCase()));
-    for (const med of result.medications) {
-      if (!existingNames.has(med.toLowerCase())) {
-        orderData.items = orderData.items || [];
-        orderData.items.push({ name: med, quantity: "as prescribed" });
-      }
-    }
-    await updateSession(from, { orderData });
+  // --- Step 2: Parse the prescription via Gemini Vision ---
+  const parsed = await parsePrescriptionImage(imageBuffer, media.mimeType);
+  if (!parsed || parsed.items.length === 0) {
+    await sendWhatsAppMessage(
+      from,
+      "I couldn't read the medications from your prescription. Please send a clearer photo, or type your medication names and quantities directly."
+    );
+    return;
   }
 
-  await routeToPharmacy(from, orderData, session.orderId);
+  console.log(`[GEMINI VISION] Parsed ${parsed.items.length} item(s) from prescription for ${from}`);
+
+  // --- Step 3A: AWAITING_PRESCRIPTION — merge into an existing pending order ---
+  if (session.state === SESSION_STATES.AWAITING_PRESCRIPTION) {
+    console.log(`[STATE 2] Merging prescription items into existing order for ${from}`);
+
+    // Also run the legacy validity check so we reject obviously non-prescription images
+    const verifyResult = await verifyPrescriptionImage(media.base64Buffer, media.mimeType);
+    if (!verifyResult || !verifyResult.isValid) {
+      console.log(`[STATE 2] Image failed validity check for ${from}`);
+      await sendWhatsAppMessage(
+        from,
+        "The image doesn't appear to be a valid medical prescription. Please upload a clear photo showing the doctor's details, medications, and signature."
+      );
+      return;
+    }
+
+    await updateSession(from, { prescriptionVerified: true });
+
+    const orderData = session.orderData || {};
+    const existingNames = new Set((orderData.items || []).map((i) => i.name.toLowerCase()));
+
+    for (const item of parsed.items) {
+      if (!existingNames.has(item.name.toLowerCase())) {
+        orderData.items = orderData.items || [];
+        orderData.items.push({ name: item.name, quantity: String(item.quantity) });
+      }
+    }
+
+    if (parsed.notes) {
+      orderData.prescriptionNotes = parsed.notes;
+    }
+
+    await updateSession(from, { orderData });
+    console.log(`[STATE 2] Updated order items for ${from}:`, JSON.stringify(orderData.items));
+
+    await routeToPharmacy(from, orderData, session.orderId);
+    return;
+  }
+
+  // --- Step 3B: Direct image (no prior text order) — build order from prescription ---
+  console.log(`[STATE 2] Direct prescription image from ${from} with no pending order. Building order from parsed data.`);
+
+  // We don't have the customer's delivery info yet — ask for it first
+  const orderId = generateOrderId();
+  const partialOrderData = {
+    items: parsed.items.map((i) => ({ name: i.name, quantity: String(i.quantity) })),
+    prescriptionNotes: parsed.notes || "",
+    requiresPrescription: true,
+  };
+
+  await updateSession(from, {
+    state: SESSION_STATES.AWAITING_PRESCRIPTION,
+    orderData: partialOrderData,
+    orderId,
+  });
+
+  const itemList = parsed.items.map((i) => `• ${i.name} (x${i.quantity})`).join("\n");
+  await sendWhatsAppMessage(
+    from,
+    `✅ I've read your prescription! Here are the medications I found:\n\n${itemList}\n\n` +
+    `To complete your order, please reply with your full name, delivery address, and state.\n` +
+    `Example: _John Doe, 12 Broad Street Lagos Island, Lagos_`
+  );
 }
 
 async function routeToPharmacy(from, orderData, orderId) {
