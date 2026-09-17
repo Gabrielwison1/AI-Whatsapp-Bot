@@ -32,4 +32,9 @@ app.listen(PORT, () => {
   console.log(`[SERVER] AI Provider: ${process.env.AI_PROVIDER || "gemini"}`);
 });
 
+// Health check endpoint for uptime monitors
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
 export default app;
