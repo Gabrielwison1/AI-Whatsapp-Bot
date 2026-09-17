@@ -64,23 +64,23 @@ async function processWebhook(body) {
     }
   } catch (error) {
     console.error(`[WEBHOOK] Error processing message from ${from}:`, error);
-    await sendWhatsAppMessage(
-      from,
-      "Something went wrong processing your message. Please try again."
-    );
+    
+    // Ensure session is reset so user is not permanently stuck
+    await resetSession(from);
+
+    const errorMessage = error.isBusyError
+      ? error.message
+      : "Something went wrong processing your message. Please try again.";
+
+    await sendWhatsAppMessage(from, errorMessage);
   }
 }
 
 async function handleTextMessage(from, text, session) {
   if (session.state === SESSION_STATES.AWAITING_PRESCRIPTION) {
-    await sendWhatsAppMessage(
-      from,
-      "I'm waiting for a prescription photo. Please upload a clear image of your prescription."
-    );
-    return;
-  }
-
-  if (session.state === SESSION_STATES.AWAITING_PAYMENT) {
+    console.log(`[STATE 1] User in AWAITING_PRESCRIPTION sent text instead of photo. Routing to text parser.`);
+    // Fall through to processNewOrder
+  } else if (session.state === SESSION_STATES.AWAITING_PAYMENT) {
     await sendWhatsAppMessage(
       from,
       "Your order is already being processed. Please complete payment using the link sent earlier, or type 'new order' to start again."

@@ -91,22 +91,46 @@ export async function parsePrescriptionImage(imageBuffer, mimeType = "image/jpeg
   try {
     const genAI = new GoogleGenAI({ apiKey });
 
-    const response = await genAI.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: [
-        {
-          inlineData: {
-            mimeType,
-            data: base64Data,
+    let response;
+    let retries = 0;
+    const maxRetries = 2; // "3 attempts" total (initial + 2 retries)
+
+    while (true) {
+      try {
+        response = await genAI.models.generateContent({
+          model: "gemini-3.6-flash",
+          contents: [
+            {
+              inlineData: {
+                mimeType,
+                data: base64Data,
+              },
+            },
+            { text: PRESCRIPTION_PARSE_PROMPT },
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: PRESCRIPTION_PARSE_SCHEMA,
           },
-        },
-        { text: PRESCRIPTION_PARSE_PROMPT },
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: PRESCRIPTION_PARSE_SCHEMA,
-      },
-    });
+        });
+        break;
+      } catch (apiErr) {
+        if (apiErr.status === 503 || apiErr.message.includes('503') || apiErr.message.includes('Service Unavailable')) {
+          if (retries < maxRetries) {
+            const delay = retries === 0 ? 1000 : 2000;
+            console.warn(`[GEMINI VISION] 503 Error. Retrying in ${delay}ms... (Retry ${retries + 1}/${maxRetries})`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            retries++;
+          } else {
+            const busyErr = new Error("Our image recognition service is temporarily busy. Please try sending your photo again in a moment, or type out your medications.");
+            busyErr.isBusyError = true;
+            throw busyErr;
+          }
+        } else {
+          throw apiErr;
+        }
+      }
+    }
 
     // -------------------------------------------------------------------------
     // Log the full raw string for debugging in Render logs
@@ -158,6 +182,7 @@ export async function parsePrescriptionImage(imageBuffer, mimeType = "image/jpeg
     return parsed;
   } catch (err) {
     console.error("[GEMINI VISION] Unexpected error during Gemini Vision call:", err.message);
+    if (err.isBusyError) throw err;
     return null;
   }
 }
