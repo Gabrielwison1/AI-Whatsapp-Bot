@@ -207,22 +207,23 @@ async function routeToPharmacy(from, orderData, orderId) {
 
 async function sendPaymentSummary(from, orderData, orderId, pharmacy) {
   const items = (orderData.items || []).map((i) => `• ${i.name}${i.quantity ? ` (${i.quantity})` : ""}`).join("\n");
-  
+
+  // Declared outside try blocks so it's accessible to both Paystack init and Order.create
+  // In production, replace with a real price calculation based on orderData.items
+  const totalAmountNaira = 5000;
+
   let paystackUrl = `https://paystack.com/pay/mock-prosemedistore-${orderId.toLowerCase()}`;
-  
+
   try {
-    // Arbitrary estimate amount for example purposes (e.g. 5000 Naira)
-    // In production, this should be dynamically calculated based on orderData.items
-    const totalAmountNaira = 5000; 
     paystackUrl = await initializePaystackTransaction(from, orderId, totalAmountNaira);
     console.log(`[STATE 4] Generated real Paystack payment link for ${from}: ${paystackUrl}`);
   } catch (err) {
-    console.error(`[STATE 4] Paystack initialization failed for ${from}, falling back to mock URL.`);
+    console.error(`[STATE 4] Paystack initialization failed for ${from}, falling back to mock URL. Reason:`, err.message);
   }
 
-  // Save the Order document to MongoDB
+  // Persist the Order to MongoDB with status PENDING_PAYMENT before sending the link
   try {
-    await Order.create({
+    const newOrder = await Order.create({
       orderId,
       customerPhone: from,
       customerName: orderData.customerName,
@@ -233,8 +234,9 @@ async function sendPaymentSummary(from, orderData, orderId, pharmacy) {
       totalAmount: totalAmountNaira,
       status: 'PENDING_PAYMENT',
     });
+    console.log('[DB SUCCESS] Created order:', newOrder._id);
   } catch (err) {
-    console.error(`[STATE 4] Error saving order to DB for ${from}:`, err);
+    console.error(`[DB ERROR] Failed to save order ${orderId} for ${from}. Mongoose error:`, err.message, err.errors);
   }
 
   const summary = `✅ Order Confirmed (#${orderId})
@@ -289,11 +291,20 @@ webhookRouter.post("/paystack", async (req, res) => {
       if (customerPhone && orderId) {
         console.log(`[PAYSTACK WEBHOOK] Payment successful for order ${orderId} (Phone: ${customerPhone})`);
         
-        // Update order status in MongoDB
+        // Update existing order status in MongoDB — never insert a new record
         try {
-          await Order.findOneAndUpdate({ orderId }, { status: 'PAID', paystackReference: event.data.reference });
+          const updatedOrder = await Order.findOneAndUpdate(
+            { orderId },
+            { $set: { status: 'PAID', paystackReference: event.data.reference } },
+            { new: true }
+          );
+          if (updatedOrder) {
+            console.log(`[DB SUCCESS] Order ${orderId} marked as PAID. Doc ID: ${updatedOrder._id}`);
+          } else {
+            console.warn(`[DB WARN] No order found with orderId: ${orderId} to mark as PAID.`);
+          }
         } catch (err) {
-          console.error(`[PAYSTACK WEBHOOK] Failed to update order status for ${orderId}:`, err);
+          console.error(`[DB ERROR] Failed to update order ${orderId} to PAID. Mongoose error:`, err.message);
         }
 
         const receiptMessage = `🎉 Payment Successful!\n\nWe have received your payment for order #${orderId}. The pharmacy will now begin processing your fulfillment.`;
