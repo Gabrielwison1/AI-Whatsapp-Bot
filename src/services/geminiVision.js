@@ -1,52 +1,80 @@
 import { GoogleGenAI } from "@google/genai";
 
+// ---------------------------------------------------------------------------
+// Schema — kept minimal: only items[] is required.
+// notes is dropped to keep the output surface as small as possible and avoid
+// the model refusing to parse lenient/informal images due to missing fields.
+// ---------------------------------------------------------------------------
 const PRESCRIPTION_PARSE_SCHEMA = {
   type: "object",
   properties: {
     items: {
       type: "array",
-      description: "List of medications extracted from the prescription",
+      description: "List of medications visible in the image",
       items: {
         type: "object",
         properties: {
           name: {
             type: "string",
-            description: "Name of the medication exactly as written on the prescription",
+            description: "Medication name exactly as visible in the image",
           },
           quantity: {
             type: "number",
-            description: "Numeric quantity prescribed (e.g. 1 for '1 pack', 2 for '2 tablets'). Default to 1 if not specified.",
+            description: "Numeric quantity (default 1 if not specified)",
           },
         },
         required: ["name", "quantity"],
       },
     },
-    notes: {
-      type: "string",
-      description: "Any special usage instructions or dosage notes visible on the prescription. Empty string if none.",
-    },
   },
-  required: ["items", "notes"],
+  required: ["items"],
 };
 
-const PRESCRIPTION_PARSE_PROMPT = `You are a medical prescription parser for a Nigerian telemedicine pharmacy.
-Examine the provided prescription image and extract ALL prescribed medications.
-Return ONLY a JSON object with this exact structure:
-{
-  "items": [{ "name": "Medication Name", "quantity": 1 }],
-  "notes": "any special usage instructions if visible"
+// ---------------------------------------------------------------------------
+// Lenient OCR prompt — accepts prescriptions, handwritten notes,
+// pill bottle labels, screenshots, etc. No formal format required.
+// ---------------------------------------------------------------------------
+const PRESCRIPTION_PARSE_PROMPT = `You are a flexible medical OCR assistant. Analyze this image (which could be a doctor's prescription, handwritten note, pill bottle label, or screenshot). Extract ANY visible medication names, dosages, and quantities.
+
+Do NOT require a formal doctor signature, clinic header, or specific layout. If medication text is visible, extract it.
+
+Return ONLY a JSON object formatted as:
+{ "items": [{ "name": "Medication Name", "quantity": 1 }] }
+
+If absolutely no medications can be identified, return { "items": [] }.`;
+
+// ---------------------------------------------------------------------------
+// Utility: strip Markdown code fences Gemini sometimes wraps its output in
+// e.g. ```json\n{...}\n``` or ```\n{...}\n```
+// ---------------------------------------------------------------------------
+function stripMarkdownCodeBlock(raw) {
+  return raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
 }
-Rules:
-- Include every distinct medication listed on the prescription.
-- Use the medication name exactly as written (brand or generic).
-- Set quantity to the numeric value (e.g. 30 for "30 tablets", 1 if unspecified).
-- If the image is unreadable or is not a prescription, return { "items": [], "notes": "" }.`;
+
+// ---------------------------------------------------------------------------
+// Utility: attempt to extract the first valid JSON object from an arbitrary
+// string, even if the model prefixes it with a sentence.
+// ---------------------------------------------------------------------------
+function extractJsonObject(raw) {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return null;
+  return raw.slice(start, end + 1);
+}
 
 /**
- * Parses a prescription image using Gemini Vision and returns structured medication data.
+ * Parses an image using Gemini Vision and extracts any visible medication data.
+ * Designed to be maximally lenient — works on prescriptions, bottle labels,
+ * handwritten notes, and screenshots.
+ *
  * @param {Buffer} imageBuffer - Raw image buffer from WhatsApp media download.
- * @param {string} mimeType - MIME type of the image (e.g. "image/jpeg").
- * @returns {Promise<{ items: Array<{ name: string, quantity: number }>, notes: string } | null>}
+ * @param {string} mimeType    - MIME type of the image (e.g. "image/jpeg").
+ * @returns {Promise<{ items: Array<{ name: string, quantity: number }> } | null>}
+ *   Returns null only when Gemini fails entirely or finds zero medications.
  */
 export async function parsePrescriptionImage(imageBuffer, mimeType = "image/jpeg") {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -56,7 +84,9 @@ export async function parsePrescriptionImage(imageBuffer, mimeType = "image/jpeg
   }
 
   const base64Data = imageBuffer.toString("base64");
-  console.log(`[GEMINI VISION] Parsing prescription image. MIME: ${mimeType}, base64 length: ${base64Data.length}`);
+  console.log(
+    `[GEMINI VISION] Sending image to Gemini. MIME: ${mimeType}, base64 length: ${base64Data.length}`
+  );
 
   try {
     const genAI = new GoogleGenAI({ apiKey });
@@ -78,21 +108,56 @@ export async function parsePrescriptionImage(imageBuffer, mimeType = "image/jpeg
       },
     });
 
-    const text = response.text;
-    console.log("[GEMINI VISION] Raw prescription parse response:", text.substring(0, 300));
+    // -------------------------------------------------------------------------
+    // Log the full raw string for debugging in Render logs
+    // -------------------------------------------------------------------------
+    const rawText = response.text;
+    console.log("[GEMINI VISION] Raw Gemini response (full):", rawText);
 
-    const parsed = JSON.parse(text);
+    // -------------------------------------------------------------------------
+    // Robust JSON parsing with two fallback layers:
+    //   1. Strip Markdown code fences and parse
+    //   2. Extract the first {...} block from the string
+    // -------------------------------------------------------------------------
+    let parsed = null;
 
-    // Guard: treat empty items array as a parse failure
+    // Attempt 1: clean code fences → JSON.parse
+    try {
+      const cleaned = stripMarkdownCodeBlock(rawText);
+      parsed = JSON.parse(cleaned);
+      console.log("[GEMINI VISION] JSON parsed successfully (attempt 1 — stripped fences).");
+    } catch (parseErr1) {
+      console.warn("[GEMINI VISION] Attempt 1 parse failed:", parseErr1.message);
+
+      // Attempt 2: extract the first {...} object and parse
+      try {
+        const extracted = extractJsonObject(rawText);
+        if (!extracted) throw new Error("No JSON object found in response");
+        parsed = JSON.parse(extracted);
+        console.log("[GEMINI VISION] JSON parsed successfully (attempt 2 — extracted object).");
+      } catch (parseErr2) {
+        console.error("[GEMINI VISION] Both parse attempts failed. Raw response was:", rawText);
+        console.error("[GEMINI VISION] Attempt 2 error:", parseErr2.message);
+        return null;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Guard: empty items → inform caller to ask user for manual input
+    // -------------------------------------------------------------------------
     if (!parsed.items || parsed.items.length === 0) {
-      console.warn("[GEMINI VISION] Prescription parsed but no medications found.");
+      console.warn("[GEMINI VISION] Gemini returned an empty items array — no medications identified.");
       return null;
     }
 
-    console.log(`[GEMINI VISION] Extracted ${parsed.items.length} medication(s):`, parsed.items.map((i) => i.name).join(", "));
+    console.log(
+      `[GEMINI VISION] ✅ Extracted ${parsed.items.length} medication(s):`,
+      parsed.items.map((i) => `${i.name} (x${i.quantity})`).join(", ")
+    );
+
     return parsed;
   } catch (err) {
-    console.error("[GEMINI VISION] Failed to parse prescription image:", err.message);
+    console.error("[GEMINI VISION] Unexpected error during Gemini Vision call:", err.message);
     return null;
   }
 }
