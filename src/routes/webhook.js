@@ -1,5 +1,7 @@
 import { Router } from "express";
+import crypto from "crypto";
 import { sendWhatsAppMessage, downloadMetaMedia } from "../services/whatsapp.js";
+import { initializePaystackTransaction } from "../services/paystack.js";
 import { extractOrderFromText, verifyPrescriptionImage } from "../services/ai.js";
 import { findPharmacyByState } from "../db/pharmacies.js";
 import {
@@ -204,9 +206,18 @@ async function routeToPharmacy(from, orderData, orderId) {
 
 async function sendPaymentSummary(from, orderData, orderId, pharmacy) {
   const items = (orderData.items || []).map((i) => `• ${i.name}${i.quantity ? ` (${i.quantity})` : ""}`).join("\n");
-  const paystackUrl = `https://paystack.com/pay/mock-prosemedistore-${orderId.toLowerCase()}`;
-
-  console.log(`[STATE 4] Generating payment link for ${from}: ${paystackUrl}`);
+  
+  let paystackUrl = `https://paystack.com/pay/mock-prosemedistore-${orderId.toLowerCase()}`;
+  
+  try {
+    // Arbitrary estimate amount for example purposes (e.g. 5000 Naira)
+    // In production, this should be dynamically calculated based on orderData.items
+    const totalAmountNaira = 5000; 
+    paystackUrl = await initializePaystackTransaction(from, orderId, totalAmountNaira);
+    console.log(`[STATE 4] Generated real Paystack payment link for ${from}: ${paystackUrl}`);
+  } catch (err) {
+    console.error(`[STATE 4] Paystack initialization failed for ${from}, falling back to mock URL.`);
+  }
 
   const summary = `✅ Order Confirmed (#${orderId})
 
@@ -228,5 +239,46 @@ Please complete payment to confirm your order. Once payment is received, ${pharm
   console.log(`[STATE 4] Order ${orderId} complete for ${from}, resetting session`);
   resetSession(from);
 }
+
+// --- Paystack Webhook Handler ---
+webhookRouter.post("/paystack", async (req, res) => {
+  // Always return 200 OK immediately as per Paystack's requirements
+  res.sendStatus(200);
+
+  try {
+    // Validate Signature
+    const secret = process.env.PAYSTACK_SECRET_KEY;
+    if (!secret) {
+      console.error("[PAYSTACK WEBHOOK] Missing PAYSTACK_SECRET_KEY in environment");
+      return;
+    }
+
+    // req.body is already parsed as JSON by express.json() in server.js
+    // Paystack signature check requires hashing the raw body. 
+    // JSON.stringify works in most standard express setups, but consider using raw body parsing if signature validation fails.
+    const hash = crypto.createHmac('sha512', secret).update(JSON.stringify(req.body)).digest('hex');
+    
+    if (hash !== req.headers['x-paystack-signature']) {
+      console.error("[PAYSTACK WEBHOOK] Invalid signature");
+      return;
+    }
+
+    const event = req.body;
+    
+    if (event.event === 'charge.success') {
+      const { customerPhone, orderId } = event.data.metadata || {};
+      
+      if (customerPhone && orderId) {
+        console.log(`[PAYSTACK WEBHOOK] Payment successful for order ${orderId} (Phone: ${customerPhone})`);
+        const receiptMessage = `🎉 Payment Successful!\n\nWe have received your payment for order #${orderId}. The pharmacy will now begin processing your fulfillment.`;
+        await sendWhatsAppMessage(customerPhone, receiptMessage);
+      } else {
+        console.warn("[PAYSTACK WEBHOOK] charge.success received but missing customerPhone or orderId in metadata.");
+      }
+    }
+  } catch (error) {
+    console.error("[PAYSTACK WEBHOOK] Error processing webhook:", error);
+  }
+});
 
 export default webhookRouter;
