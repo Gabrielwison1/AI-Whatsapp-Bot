@@ -100,18 +100,38 @@ export async function extractOrderFromText(messageText) {
 
 async function extractOrderFromTextGemini(messageText) {
   const genAI = getGeminiClient();
-  const response = await genAI.models.generateContent({
-    model: "gemini-3.6-flash",
-    contents: `${TEXT_ORDER_PROMPT}\n\nCustomer message: "${messageText}"`,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: TEXT_ORDER_SCHEMA,
-    },
-  });
+  let attempts = 0;
+  let lastError;
 
-  const text = response.text;
-  console.log("[AI] Gemini text order response:", text.substring(0, 200));
-  return JSON.parse(text);
+  while (attempts < 2) {
+    try {
+      const response = await genAI.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents: `${TEXT_ORDER_PROMPT}\n\nCustomer message: "${messageText}"`,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: TEXT_ORDER_SCHEMA,
+        },
+      });
+
+      const text = response.text;
+      console.log("[AI] Gemini text order response:", text.substring(0, 200));
+      
+      const rawResponse = text.replace(/```json|```/g, '').trim();
+      console.log('[TEXT PARSER RAW]:', rawResponse);
+      
+      return JSON.parse(rawResponse);
+    } catch (error) {
+      lastError = error;
+      attempts++;
+      if (attempts < 2) {
+        console.warn(`[AI] Gemini text generation failed, retrying in 1s (attempt ${attempts})...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 async function extractOrderFromTextOpenAI(messageText) {
